@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import json
+import tempfile
+from datetime import datetime, timezone
 from datetime import date, timedelta
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote
+from urllib.request import Request, urlopen
 
 import numpy as np
 import pandas as pd
@@ -11,7 +17,7 @@ from flask import Flask, jsonify, render_template, request
 
 app = Flask(__name__)
 
-CACHE_DIR = Path(__file__).resolve().parent / ".yfinance_cache"
+CACHE_DIR = Path(tempfile.gettempdir()) / "stock-analyzer-yfinance-cache"
 CACHE_DIR.mkdir(exist_ok=True)
 yf.set_tz_cache_location(str(CACHE_DIR))
 
@@ -33,6 +39,93 @@ def _clean_float(value):
 
 def _series(values):
     return [_clean_float(value) for value in values]
+
+
+def _normalize_data(data: pd.DataFrame) -> pd.DataFrame:
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = data.columns.get_level_values(0)
+
+    required = {"Open", "Close", "Volume"}
+    if not required.issubset(data.columns):
+        raise ValueError("The data source returned an unexpected format.")
+
+    return data.dropna(subset=["Open", "Close"])
+
+
+def _download_with_yfinance(ticker: str, start: date, end: date) -> tuple[pd.DataFrame, str]:
+    data = yf.download(
+        ticker,
+        start=start.isoformat(),
+        end=end.isoformat(),
+        progress=False,
+        auto_adjust=True,
+        threads=False,
+    )
+    if data.empty:
+        raise ValueError("yfinance returned no rows.")
+
+    data = _normalize_data(data)
+    return data, "USD"
+
+
+def _download_with_yahoo_chart(ticker: str, start: date, end: date) -> tuple[pd.DataFrame, str]:
+    period1 = int(datetime.combine(start, datetime.min.time(), tzinfo=timezone.utc).timestamp())
+    period2 = int(datetime.combine(end, datetime.min.time(), tzinfo=timezone.utc).timestamp())
+    symbol = quote(ticker, safe="")
+    url = (
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+        f"?period1={period1}&period2={period2}&interval=1d&events=history"
+    )
+    request = Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+            "Accept": "application/json,text/plain,*/*",
+        },
+    )
+
+    try:
+        with urlopen(request, timeout=20) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError, TimeoutError) as exc:
+        raise ValueError(f"Yahoo Finance request failed: {exc}") from exc
+
+    chart = payload.get("chart", {})
+    error = chart.get("error")
+    if error:
+        raise ValueError(error.get("description") or "Yahoo Finance returned an error.")
+
+    result = (chart.get("result") or [None])[0]
+    if not result or not result.get("timestamp"):
+        raise ValueError("Yahoo Finance returned no chart rows.")
+
+    quote_data = result["indicators"]["quote"][0]
+    frame = pd.DataFrame(
+        {
+            "Open": quote_data.get("open", []),
+            "High": quote_data.get("high", []),
+            "Low": quote_data.get("low", []),
+            "Close": quote_data.get("close", []),
+            "Volume": quote_data.get("volume", []),
+        },
+        index=pd.to_datetime(result["timestamp"], unit="s").tz_localize(None),
+    )
+
+    currency = result.get("meta", {}).get("currency", "USD")
+    return _normalize_data(frame), currency
+
+
+def _download_market_data(ticker: str, start: date, end: date) -> tuple[pd.DataFrame, str]:
+    errors = []
+    for downloader in (_download_with_yfinance, _download_with_yahoo_chart):
+        try:
+            return downloader(ticker, start, end)
+        except Exception as exc:
+            errors.append(str(exc))
+
+    detail = " | ".join(errors)
+    raise ValueError(f"No market data was returned for '{ticker}'. Details: {detail}")
 
 
 def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -94,28 +187,8 @@ def analyze_ticker(ticker: str, months: str) -> dict:
     end = date.today() + timedelta(days=1)
     start = end - timedelta(days=days)
 
-    data = yf.download(
-        ticker,
-        start=start.isoformat(),
-        end=end.isoformat(),
-        progress=False,
-        auto_adjust=True,
-        threads=False,
-    )
-    if data.empty:
-        raise ValueError(f"No market data was returned for '{ticker}'.")
-
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.get_level_values(0)
-
-    required = {"Open", "Close", "Volume"}
-    if not required.issubset(data.columns):
-        raise ValueError("The data source returned an unexpected format.")
-
-    data = data.dropna(subset=["Open", "Close"])
+    data, currency = _download_market_data(ticker, start, end)
     data = _add_indicators(data)
-    stock = yf.Ticker(ticker)
-    currency = stock.fast_info.get("currency", "USD") if stock.fast_info else "USD"
 
     labels = [idx.strftime("%Y-%m-%d") for idx in data.index]
     signal_log = []
